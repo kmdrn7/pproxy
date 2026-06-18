@@ -94,6 +94,7 @@ func (l *HTTPListener) Shutdown(ctx context.Context) error {
 func (l *HTTPListener) handle(w http.ResponseWriter, r *http.Request) {
 	metrics.ActiveConnections().WithLabelValues(string(l.proto), l.Addr()).Inc()
 	defer metrics.ActiveConnections().WithLabelValues(string(l.proto), l.Addr()).Dec()
+	l.deps.Log.Debug("http: request", "method", r.Method, "host", r.Host, "url", r.URL.String(), "remote", r.RemoteAddr)
 
 	if !l.deps.Auth.Empty() {
 		user, pass, ok := auth.ParseProxyAuthorization(r.Header.Get("Proxy-Authorization"))

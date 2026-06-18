@@ -116,6 +116,7 @@ func (l *SOCKS5Listener) Shutdown(ctx context.Context) error {
 func (l *SOCKS5Listener) handle(clientConn net.Conn) {
 	defer clientConn.Close()
 	_ = clientConn.SetDeadline(time.Now().Add(2 * time.Minute))
+	l.deps.Log.Debug("socks5: request", "remote", clientConn.RemoteAddr().String())
 
 	methodReq, err := auth.ReadSOCKS5Methods(clientConn)
 	if err != nil {

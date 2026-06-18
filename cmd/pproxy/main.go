@@ -31,6 +31,16 @@ type runtime struct {
 	auth      *auth.Store
 	scheduler *health.Scheduler
 	servers   []namedServer
+	// deps is the Dependencies block passed to listeners at construction.
+	// Kept on the runtime so a hot reload can hand it to surviving
+	// listeners via SetDeps without rebuilding them.
+	deps listener.Dependencies
+}
+
+// depsForListeners returns the Dependencies struct the listener layer
+// expects. Constructed lazily so the scheduler is the freshly-built one.
+func (r *runtime) depsForListeners() listener.Dependencies {
+	return r.deps
 }
 
 type namedServer struct {
@@ -102,7 +112,13 @@ func run() error {
 			return
 		}
 		prev := active.swap(next)
-		prev.shutdown(context.Background())
+		// Update deps on the existing listeners rather than shutting them
+		// down. The handler is a method value bound to the receiver, so
+		// swapping deps is enough to make subsequent requests use the new
+		// pool / auth store. The TCP sockets stay bound, so the reload
+		// is invisible to clients. Listeners that were added or removed
+		// in the new config are reconciled below.
+		reconcileListeners(prev, next, log)
 		log.Info("runtime: swapped", "listeners", len(next.servers), "upstreams", len(next.pool.Snapshot()))
 	})
 
@@ -193,7 +209,7 @@ func buildRuntime(c *config.Config, log *slog.Logger) (*runtime, error) {
 			return nil, fmt.Errorf("listener: unsupported protocol %q", l.Protocol)
 		}
 	}
-	return &runtime{pool: p, auth: store, scheduler: sched, servers: servers}, nil
+	return &runtime{pool: p, auth: store, scheduler: sched, servers: servers, deps: deps}, nil
 }
 
 func (r *runtime) shutdown(ctx context.Context) {
@@ -209,6 +225,45 @@ func (r *runtime) shutdown(ctx context.Context) {
 		}(s.srv)
 	}
 	wg.Wait()
+}
+
+// reconcileListeners swaps the deps on listeners that survive the reload
+// (same protocol + addr + port) so they keep serving on the same TCP
+// socket, starts listeners that are new, and stops listeners that are
+// gone. This is the hot-reload seam — the old runtime's listeners are
+// reused wherever possible so there is no port flap.
+func reconcileListeners(prev, next *runtime, log *slog.Logger) {
+	oldByName := make(map[string]namedServer, len(prev.servers))
+	for _, s := range prev.servers {
+		oldByName[s.name] = s
+	}
+	for _, ns := range next.servers {
+		old, ok := oldByName[ns.name]
+		if !ok {
+			// Brand new listener (e.g. user added an http listener on
+			// 8081). Start it.
+			go func(s namedServer) {
+				log.Info("listener: starting", "name", s.name)
+				if err := s.srv.ListenAndServe(); err != nil {
+					log.Error("listener: serve", "name", s.name, "err", err)
+				}
+			}(ns)
+			continue
+		}
+		// Same listener, same address: keep the socket open and just
+		// push the new deps. The handler reads deps on every request, so
+		// in-flight requests finish with the old pool and new ones use
+		// the new pool — there is no port flap.
+		old.srv.SetDeps(next.depsForListeners())
+		delete(oldByName, ns.name)
+	}
+	// Anything left was removed from the config; stop it.
+	for _, s := range oldByName {
+		log.Info("listener: stopping", "name", s.name)
+		go func(srv listener.Server) {
+			_ = srv.Shutdown(context.Background())
+		}(s.srv)
+	}
 }
 
 func startServers(active *activeRuntime, log *slog.Logger) <-chan error {

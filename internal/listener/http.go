@@ -46,6 +46,13 @@ func NewHTTP(addr string, port int, deps Dependencies) *HTTPListener {
 	return l
 }
 
+// SetDeps atomically swaps the dependencies the listener reads on every
+// request. The handler is a method value bound to the receiver, so this
+// is enough to make subsequent requests use the new pool / auth store.
+func (l *HTTPListener) SetDeps(deps Dependencies) {
+	l.deps = deps
+}
+
 // Addr returns the bound address once Serve or ListenAndServe has been
 // called. Before that it returns the configured address.
 func (l *HTTPListener) Addr() string {

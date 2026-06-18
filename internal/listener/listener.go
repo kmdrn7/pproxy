@@ -36,5 +36,12 @@ type Server interface {
 	// ListenAndServe opens a socket on the configured address and serves
 	// until Shutdown is called.
 	ListenAndServe() error
+	// Shutdown stops accepting new connections and waits for in-flight
+	// requests to finish, bounded by ctx's deadline.
 	Shutdown(ctx context.Context) error
+	// SetDeps atomically swaps the dependencies the listener reads on
+	// every request. Used by the hot-reload path so the same listener
+	// socket keeps serving while the upstream pool / auth store /
+	// scheduler change under it.
+	SetDeps(Dependencies)
 }

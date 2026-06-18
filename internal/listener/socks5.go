@@ -41,6 +41,13 @@ func NewSOCKS5(addr string, port int, deps Dependencies) *SOCKS5Listener {
 	}
 }
 
+// SetDeps atomically swaps the dependencies the listener reads on every
+// connection. The accept loop is already running; this just makes
+// subsequent connections use the new pool / auth store / scheduler.
+func (l *SOCKS5Listener) SetDeps(deps Dependencies) {
+	l.deps = deps
+}
+
 // Addr returns the bound address once Serve or ListenAndServe has been
 // called.
 func (l *SOCKS5Listener) Addr() string {

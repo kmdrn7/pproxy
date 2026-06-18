@@ -487,6 +487,83 @@ func mustClosedAddr(t *testing.T) string {
 	return addr
 }
 
+// TestHTTPListener_SetDeps_SwimsWithoutRestart verifies the hot-reload
+// contract: SetDeps must update the pool/auth the listener uses for
+// subsequent requests without taking the listening socket down. This
+// is what makes `pproxy` reloads invisible to clients.
+func TestHTTPListener_SetDeps_SwimsWithoutRestart(t *testing.T) {
+	t.Parallel()
+	up1 := newUpstreamProxy(t)
+	up2 := newUpstreamProxy(t)
+
+	p1 := pool.New([]config.Upstream{
+		{Name: "first", Type: config.ProtocolHTTP, Address: up1.server.Listener.Addr().String()},
+	}, config.Health{FailThreshold: 1, SuccessThreshold: 1}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	p2 := pool.New([]config.Upstream{
+		{Name: "second", Type: config.ProtocolHTTP, Address: up2.server.Listener.Addr().String()},
+	}, config.Health{FailThreshold: 1, SuccessThreshold: 1}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	store, _ := auth.New(nil)
+	deps1 := listener.Dependencies{
+		Pool:      p1,
+		Auth:      store,
+		Scheduler: fakeProber{},
+		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	srv := listener.NewHTTP("127.0.0.1", 0, deps1)
+	addr := startListener(t, srv)
+
+	// First request goes to up1.
+	proxyURL, _ := url.Parse("http://" + addr)
+	c := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}, Timeout: 5 * time.Second}
+	resp, err := c.Get("http://example.com/a")
+	if err != nil {
+		t.Fatalf("Get 1: %v", err)
+	}
+	resp.Body.Close()
+	select {
+	case r := <-up1.seen:
+		if r.URL.Path != "/a" {
+			t.Errorf("up1 saw %q, want /a", r.URL.Path)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("up1 did not see first request")
+	}
+	select {
+	case <-up2.seen:
+		t.Errorf("up2 saw a request before SetDeps")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Hot reload: swap to the second pool without shutting the listener.
+	deps2 := listener.Dependencies{
+		Pool:      p2,
+		Auth:      store,
+		Scheduler: fakeProber{},
+		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	srv.SetDeps(deps2)
+
+	resp, err = c.Get("http://example.com/b")
+	if err != nil {
+		t.Fatalf("Get 2: %v", err)
+	}
+	resp.Body.Close()
+	select {
+	case r := <-up2.seen:
+		if r.URL.Path != "/b" {
+			t.Errorf("up2 saw %q, want /b", r.URL.Path)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("up2 did not see second request after SetDeps")
+	}
+	select {
+	case <-up1.seen:
+		t.Errorf("up1 saw a request after SetDeps")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func TestHTTPListener_ConnectTunnel_NoUpstreams(t *testing.T) {
 	t.Parallel()
 	// empty pool: CONNECT should respond with a body that explains the

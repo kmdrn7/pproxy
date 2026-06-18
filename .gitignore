@@ -1,0 +1,47 @@
+# build output
+/bin/
+/pproxy
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# test/coverage
+*.test
+*.out
+coverage.html
+coverage.txt
+coverage.xml
+
+# go workspace
+go.work
+go.work.sum
+
+# dependency directories (not using modules)
+/vendor/
+
+# environment & config
+.env
+.env.local
+*.env.local
+config.yaml
+config.local.yaml
+config.*.local.yaml
+
+# logs
+*.log
+logs/
+
+# editor / os
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# misc
+*.tmp
+*.bak

@@ -1,0 +1,14 @@
+version: "2"
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  exclusions:
+    rules:
+      - path: (.+)\.go$
+        text: 'Error return value of `(fs|conn|clientConn|upstreamConn|listener|serverConn|resp2?\.Body)\.Close` is not checked'
+      - path: (.+)\.go$
+        text: 'Error return value of `c\.Close` is not checked'
+      - path: (.+)\.go$
+        text: 'Error return value of `fmt\.Fprintf` is not checked'

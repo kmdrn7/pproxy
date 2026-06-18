@@ -1,0 +1,65 @@
+# pproxy configuration example.
+# Copy to config.yaml and edit.
+
+logging:
+  level: info        # debug, info, warn, error
+  format: json       # json, text
+
+server:
+  metrics_address: 0.0.0.0:9090
+  shutdown_timeout: 30s
+
+health:
+  interval: 15s
+  timeout: 5s
+  fail_threshold: 2
+  success_threshold: 2
+  # The probe destination. Defaults to a port-80 URL on example.com so
+  # strict forward proxies do not reject the request for a port-mismatch
+  # with the scheme. Override if your network cannot reach example.com
+  # or you want probes to hit an internal endpoint.
+  probe_url: http://example.com/
+  probe_host: example.com:80
+
+auth:
+  users:
+    - username: alice
+      # generate with: htpasswd -bnBC 10 "" 'secret' | tr -d ':\n'
+      password_hash: $2y$10$replace_with_real_bcrypt_hash
+
+listen:
+  - protocol: http
+    address: 0.0.0.0
+    port: 8080
+  - protocol: socks5
+    address: 0.0.0.0
+    port: 1080
+
+pool:
+  # These are placeholders. Replace each `address` with a real upstream
+  # proxy reachable from where pproxy runs, or remove the entry entirely.
+  # Health checks will mark unreachable upstreams as unhealthy, and a
+  # client request that cannot find a healthy upstream will get a 502
+  # with the reason in the response body.
+
+  - name: us-east-1
+    type: http
+    address: replace-me.example.com:3128
+    username: ""            # optional, used to authenticate to the upstream
+    password: ""
+    tls: false
+    insecure_skip_verify: false
+    ca_file: ""             # optional PEM bundle
+    dial_timeout: 10s
+
+  - name: eu-socks5
+    type: socks5
+    address: replace-me.example.com:1080
+    dial_timeout: 10s
+
+  - name: brightdata-tls
+    type: http
+    address: replace-me.example.com:443
+    tls: true
+    username: user
+    password: pass

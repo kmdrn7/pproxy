@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kmdrn7/pproxy/internal/config"
@@ -58,7 +59,7 @@ func (t ProbeTargets) toLower() probeTargets {
 }
 
 // Scheduler runs the per-upstream probe loop. It is safe to start exactly
-// once and stop via context cancellation.
+// once and stop via Stop (or context cancellation passed to Run).
 type Scheduler struct {
 	pool    *pool.Pool
 	health  config.Health
@@ -66,6 +67,10 @@ type Scheduler struct {
 	log     *slog.Logger
 
 	requests chan string
+
+	stopOnce sync.Once
+	stop     chan struct{}
+	done     chan struct{}
 }
 
 // New builds a Scheduler using the default probe targets.
@@ -83,7 +88,17 @@ func NewWithTargets(p *pool.Pool, h config.Health, t ProbeTargets, log *slog.Log
 		targets:  t.toLower(),
 		log:      log.With("component", "health"),
 		requests: make(chan string, 64),
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
 	}
+}
+
+// Stop signals the scheduler to exit and waits for Run to return. Safe to
+// call multiple times and from any goroutine. Used on config reload so the
+// new scheduler can take over without leaking the previous goroutine.
+func (s *Scheduler) Stop() {
+	s.stopOnce.Do(func() { close(s.stop) })
+	<-s.done
 }
 
 // RequestImmediateProbe asks the scheduler to re-probe name at the next
@@ -96,10 +111,11 @@ func (s *Scheduler) RequestImmediateProbe(name string) {
 	}
 }
 
-// Run blocks until ctx is cancelled. The first probe of every upstream is
-// run synchronously before the ticker starts so the pool has accurate state
-// when listeners begin accepting traffic.
+// Run blocks until ctx is cancelled or Stop is called. The first probe of
+// every upstream is run synchronously before the ticker starts so the pool
+// has accurate state when listeners begin accepting traffic.
 func (s *Scheduler) Run(ctx context.Context) error {
+	defer close(s.done)
 	for _, name := range s.pool.Names() {
 		if ctx.Err() != nil {
 			return nil
@@ -113,6 +129,8 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			return nil
+		case <-s.stop:
 			return nil
 		case <-ticker.C:
 			for _, name := range s.pool.Names() {

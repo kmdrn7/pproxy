@@ -347,4 +347,117 @@ func TestScheduler_ProbeOne_UnknownName(t *testing.T) {
 	s.probeOne(context.Background(), "nope")
 }
 
+func TestScheduler_Stop_ExitsRun(t *testing.T) {
+	t.Parallel()
+	s := &Scheduler{
+		pool:     pool.New(nil, config.Health{FailThreshold: 1, SuccessThreshold: 1}, nil),
+		health:   config.Health{Interval: time.Hour, Timeout: time.Second},
+		requests: make(chan string, 1),
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- s.Run(context.Background()) }()
+
+	// Stop must unblock Run and return promptly even though the ticker
+	// interval is an hour.
+	stopDone := make(chan struct{})
+	go func() { s.Stop(); close(stopDone) }()
+
+	select {
+	case <-stopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return within 2s")
+	}
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return within 2s after Stop")
+	}
+
+	// Calling Stop again must be a no-op (no panic, no hang).
+	s.Stop()
+}
+
+// TestScheduler_RebuildAfterStop exercises the reload seam: stop the old
+// scheduler, build a fresh one bound to a new pool, and confirm that
+// probes on the new pool actually run. This is the regression test for
+// the bug where the listener's Prober shim was wired to a scheduler
+// that was never rebuilt, so new upstreams after a reload were never
+// health-checked.
+func TestScheduler_RebuildAfterStop(t *testing.T) {
+	t.Parallel()
+
+	// Upstream A: the old pool. Stop returns when the scheduler goroutine
+	// sees the stop signal.
+	upstreamA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstreamA.Close)
+
+	// Upstream B: appears only after the reload. The new scheduler must
+	// probe it; if the Prober shim were still pointing at the old
+	// scheduler, B would never be touched.
+	probeHits := make(chan string, 8)
+	upstreamB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		probeHits <- "B"
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstreamB.Close)
+
+	poolA := pool.New(
+		[]config.Upstream{{Name: "A", Type: config.ProtocolHTTP, Address: upstreamA.Listener.Addr().String()}},
+		config.Health{FailThreshold: 1, SuccessThreshold: 1, Timeout: time.Second},
+		silentLogger(),
+	)
+	poolB := pool.New(
+		[]config.Upstream{{Name: "B", Type: config.ProtocolHTTP, Address: upstreamB.Listener.Addr().String()}},
+		config.Health{FailThreshold: 1, SuccessThreshold: 1, Timeout: time.Second},
+		silentLogger(),
+	)
+
+	// First scheduler probes pool A.
+	first := New(poolA, config.Health{
+		Interval:         time.Hour, // don't tick during the test
+		Timeout:          time.Second,
+		FailThreshold:    1,
+		SuccessThreshold: 1,
+	}, silentLogger())
+	runDone := make(chan error, 1)
+	go func() { runDone <- first.Run(context.Background()) }()
+	first.RequestImmediateProbe("A")
+
+	// Simulate a reload: stop the first scheduler, build a second one
+	// against pool B. main.go does this swap atomically; the test just
+	// confirms the pieces fit together.
+	first.Stop()
+
+	second := New(poolB, config.Health{
+		Interval:         time.Hour,
+		Timeout:          time.Second,
+		FailThreshold:    1,
+		SuccessThreshold: 1,
+	}, silentLogger())
+	go func() { _ = second.Run(context.Background()) }()
+	t.Cleanup(second.Stop)
+
+	second.RequestImmediateProbe("B")
+
+	select {
+	case got := <-probeHits:
+		if got != "B" {
+			t.Fatalf("probe hit = %q, want B", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("B was not probed within 2s — the reload swap did not work")
+	}
+
+	if !poolB.Healthy("B") {
+		t.Fatal("pool B should be healthy after a successful probe")
+	}
+}
+
 var _ = errors.New

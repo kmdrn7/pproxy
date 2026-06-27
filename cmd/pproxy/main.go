@@ -31,16 +31,37 @@ type runtime struct {
 	auth      *auth.Store
 	scheduler *health.Scheduler
 	servers   []namedServer
-	// deps is the Dependencies block passed to listeners at construction.
-	// Kept on the runtime so a hot reload can hand it to surviving
-	// listeners via SetDeps without rebuilding them.
-	deps listener.Dependencies
+	// active is the swap-handle that owns this runtime. Held so the
+	// Prober shim can resolve to whichever scheduler is currently
+	// registered (i.e. this one, until the next swap).
+	active *activeRuntime
 }
 
-// depsForListeners returns the Dependencies struct the listener layer
-// expects. Constructed lazily so the scheduler is the freshly-built one.
+// Prober returns a listener.Prober that dispatches to whichever scheduler
+// is current in the active runtime. The indirection is what lets the
+// listener side keep using the same Dependencies value across reloads
+// while the underlying scheduler is rebuilt underneath it.
+func (r *runtime) Prober() listener.Prober {
+	return proberFunc(func(name string) { r.active.scheduler().RequestImmediateProbe(name) })
+}
+
+// proberFunc adapts a function to the listener.Prober interface so callers
+// can construct a fresh value on every request without an allocation.
+type proberFunc func(name string)
+
+func (f proberFunc) RequestImmediateProbe(name string) { f(name) }
+
+// depsForListeners builds a Dependencies block that holds the same pool,
+// auth, log, and Prober shim that survives across reloads via SetDeps.
+// The pool and auth are passed by value here; the listener captures them
+// by reference inside Dependencies, so a SetDeps swaps in the new ones.
 func (r *runtime) depsForListeners() listener.Dependencies {
-	return r.deps
+	return listener.Dependencies{
+		Pool:      r.pool,
+		Auth:      r.auth,
+		Scheduler: r.Prober(),
+		Log:       r.active.log,
+	}
 }
 
 type namedServer struct {
@@ -50,10 +71,22 @@ type namedServer struct {
 
 // activeRuntime holds the current runtime under a mutex so the config
 // reload callback, the listener starter, and the shutdown path coordinate
-// without races.
+// without races. The scheduler pointer is tracked separately so the
+// Prober shim can dispatch to the current scheduler without taking the
+// mutex on the request hot path.
 type activeRuntime struct {
-	mu sync.RWMutex
-	rt *runtime
+	log *slog.Logger
+
+	mu     sync.RWMutex
+	rt     *runtime
+	sched  atomic.Pointer[health.Scheduler]
+}
+
+func newActiveRuntime(log *slog.Logger, rt *runtime) *activeRuntime {
+	a := &activeRuntime{log: log}
+	a.rt = rt
+	a.sched.Store(rt.scheduler)
+	return a
 }
 
 func (a *activeRuntime) get() *runtime {
@@ -62,6 +95,22 @@ func (a *activeRuntime) get() *runtime {
 	return a.rt
 }
 
+// scheduler returns the currently-active scheduler. The Prober shim uses
+// this to dispatch immediate-probe requests without taking the runtime
+// mutex.
+func (a *activeRuntime) scheduler() *health.Scheduler {
+	return a.sched.Load()
+}
+
+// setScheduler atomically updates the scheduler the Prober shim dispatches
+// to. Called by the swap path after the new runtime is in place.
+func (a *activeRuntime) setScheduler(s *health.Scheduler) {
+	a.sched.Store(s)
+}
+
+// swap installs next as the current runtime and returns the previous one.
+// Callers are responsible for stopping the previous scheduler and starting
+// the next one around the swap.
 func (a *activeRuntime) swap(next *runtime) *runtime {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -93,11 +142,13 @@ func run() error {
 	// Initial runtime is built once; the config watcher handles subsequent
 	// swaps. This avoids a race where the watcher fires "startup" reload
 	// before the initial listeners are wired up.
-	rt, err := buildRuntime(initial, log)
+	active := newActiveRuntime(log, nil)
+	rt, err := buildRuntime(initial, active)
 	if err != nil {
 		return err
 	}
-	active := &activeRuntime{rt: rt}
+	active.installInitial(rt)
+	startScheduler(rt.scheduler, log)
 
 	sigCtx, sigCancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer sigCancel()
@@ -106,12 +157,19 @@ func run() error {
 	signal.Notify(reloadCh, syscall.SIGHUP)
 
 	watcher := config.NewWatcher(*cfgPath, log, func(c *config.Config) {
-		next, err := buildRuntime(c, log)
+		next, err := buildRuntime(c, active)
 		if err != nil {
 			log.Error("runtime: rebuild failed, keeping previous", "err", err)
 			return
 		}
 		prev := active.swap(next)
+		// Stop the previous scheduler so its goroutine and probe state are
+		// released, then install the new one and point the Prober shim at
+		// it. Listener deps are swapped separately below so the new pool
+		// is visible on the next request.
+		prev.scheduler.Stop()
+		startScheduler(next.scheduler, log)
+		active.setScheduler(next.scheduler)
 		// Update deps on the existing listeners rather than shutting them
 		// down. The handler is a method value bound to the receiver, so
 		// swapping deps is enough to make subsequent requests use the new
@@ -141,15 +199,6 @@ func run() error {
 		}
 	}()
 
-	healthCtx, healthCancel := context.WithCancel(context.Background())
-	defer healthCancel()
-	healthRef := newHealthRef(active, log)
-	go func() {
-		if err := healthRef.run(healthCtx); err != nil {
-			log.Error("health: scheduler exited", "err", err)
-		}
-	}()
-
 	listenErrs := startServers(active, log)
 
 	select {
@@ -167,7 +216,9 @@ func run() error {
 	_ = metricsSrv.Shutdown(shutdownCtx)
 	active.get().shutdown(shutdownCtx)
 	watchCancel()
-	healthCancel()
+	// The current scheduler is stopped after listeners so no probe fires
+	// during drain.
+	active.scheduler().Stop()
 	<-watchErr
 	log.Info("shutdown: complete")
 	return nil
@@ -175,8 +226,10 @@ func run() error {
 
 // buildRuntime constructs the pool, auth, scheduler, and listeners from a
 // validated config. It is the single integration point called both at
-// startup and on every reload.
-func buildRuntime(c *config.Config, log *slog.Logger) (*runtime, error) {
+// startup and on every reload. The returned runtime is not yet active;
+// callers wire it into the activeRuntime and start the scheduler.
+func buildRuntime(c *config.Config, active *activeRuntime) (*runtime, error) {
+	log := active.log
 	store, err := auth.New(c.Auth.Users)
 	if err != nil {
 		return nil, fmt.Errorf("auth: %w", err)
@@ -184,23 +237,19 @@ func buildRuntime(c *config.Config, log *slog.Logger) (*runtime, error) {
 	p := pool.New(c.Pool, c.Health, log)
 	sched := health.NewWithTargets(p, c.Health, health.ProbeTargets{URL: c.Health.ProbeURL, Host: c.Health.ProbeHost}, log)
 
-	deps := listener.Dependencies{
-		Pool:      p,
-		Auth:      store,
-		Scheduler: sched,
-		Log:       log,
-	}
+	rt := &runtime{pool: p, auth: store, scheduler: sched, active: active}
+
 	var servers []namedServer
 	for _, l := range c.Listen {
 		switch l.Protocol {
 		case config.ProtocolHTTP, config.ProtocolHTTPS:
-			ln := listener.NewHTTP(l.Address, l.Port, deps)
+			ln := listener.NewHTTP(l.Address, l.Port, rt.depsForListeners())
 			servers = append(servers, namedServer{
 				name: fmt.Sprintf("%s://%s:%d", l.Protocol, l.Address, l.Port),
 				srv:  ln,
 			})
 		case config.ProtocolSOCKS5:
-			ln := listener.NewSOCKS5(l.Address, l.Port, deps)
+			ln := listener.NewSOCKS5(l.Address, l.Port, rt.depsForListeners())
 			servers = append(servers, namedServer{
 				name: fmt.Sprintf("socks5://%s:%d", l.Address, l.Port),
 				srv:  ln,
@@ -209,7 +258,28 @@ func buildRuntime(c *config.Config, log *slog.Logger) (*runtime, error) {
 			return nil, fmt.Errorf("listener: unsupported protocol %q", l.Protocol)
 		}
 	}
-	return &runtime{pool: p, auth: store, scheduler: sched, servers: servers, deps: deps}, nil
+	rt.servers = servers
+	return rt, nil
+}
+
+// installInitial records rt as the active runtime and points the Prober
+// shim at its scheduler. Used once at startup; subsequent reloads go
+// through swap + setScheduler.
+func (a *activeRuntime) installInitial(rt *runtime) {
+	a.mu.Lock()
+	a.rt = rt
+	a.mu.Unlock()
+	a.sched.Store(rt.scheduler)
+}
+
+// startScheduler runs sched in the background. The scheduler owns its own
+// goroutine lifetime; callers stop it via Scheduler.Stop.
+func startScheduler(sched *health.Scheduler, log *slog.Logger) {
+	go func() {
+		if err := sched.Run(context.Background()); err != nil {
+			log.Error("health: scheduler exited", "err", err)
+		}
+	}()
 }
 
 func (r *runtime) shutdown(ctx context.Context) {
@@ -279,38 +349,6 @@ func startServers(active *activeRuntime, log *slog.Logger) <-chan error {
 		}()
 	}
 	return errs
-}
-
-// healthRef tracks the current runtime so the health scheduler can be
-// rebuilt on config reload. It encapsulates the goroutine lifecycle.
-type healthRef struct {
-	active    *activeRuntime
-	log       *slog.Logger
-	current   atomic.Pointer[health.Scheduler]
-	cancelRun context.CancelFunc
-}
-
-func newHealthRef(active *activeRuntime, log *slog.Logger) *healthRef {
-	return &healthRef{active: active, log: log}
-}
-
-func (h *healthRef) run(parent context.Context) error {
-	ctx, cancel := context.WithCancel(parent)
-	h.cancelRun = cancel
-	rt := h.active.get()
-	sched := rt.scheduler
-	h.current.Store(sched)
-	go func() {
-		if err := sched.Run(ctx); err != nil {
-			h.log.Error("health: scheduler exited", "err", err)
-		}
-	}()
-
-	// No additional logic today; the hook is here so a future
-	// enhancement can rebuild the scheduler on reload without touching
-	// the call site in run().
-	<-ctx.Done()
-	return nil
 }
 
 func envOr(key, fallback string) string {

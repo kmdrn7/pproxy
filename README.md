@@ -144,25 +144,118 @@ All logs are JSON by default and go to stdout. Fields are stable: `ts`,
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    client([Client])
+
+    subgraph pproxy["pproxy process"]
+        direction TB
+        httpL["HTTP/HTTPS Listener"]
+        socksL["SOCKS5 Listener"]
+        authS[("Auth Store")]
+        pool[["Pool\nround-robin + health state"]]
+        sched{"Health Scheduler"}
+        watcher["Config Watcher"]
+    end
+
+    upstream([Upstream proxies])
+
+    client -->|HTTP / CONNECT| httpL
+    client -->|SOCKS5| socksL
+    httpL --> authS
+    socksL --> authS
+    httpL --> pool
+    socksL --> pool
+    pool --> upstream
+    sched -->|periodic probe| upstream
+    sched -->|RecordUp / RecordDown| pool
+    watcher -->|SIGHUP / fsnotify reload| pool
+    watcher --> authS
+    watcher --> sched
 ```
-cmd/pproxy/main.go              # wiring + signal handling
-internal/logger                 # slog backed by zap/zapslog
-internal/metrics                # Prometheus collectors
-internal/config                 # YAML schema, validate, fsnotify+SIGHUP
-internal/auth                   # bcrypt store, HTTP/SOCKS5 wire format
-internal/pool                   # round-robin + atomic health state
-internal/health                 # per-protocol prober, scheduler
-internal/listener               # Server interface, Dependencies
-internal/listener/dial.go       # shared upstream dialer
-internal/listener/http.go       # HTTP + CONNECT forwarder
-internal/listener/socks5.go     # SOCKS5 forwarder
+
+```
+cmd/pproxy/main.go               # entry point: main() + run()
+cmd/pproxy/runtime.go            # runtime struct, buildRuntime, listener deps/reconcile
+cmd/pproxy/active_runtime.go     # activeRuntime swap-handle, scheduler start/stop
+cmd/pproxy/util.go                # envOr, signal-channel relay
+
+internal/logger                  # slog backed by zap/zapslog
+internal/metrics                 # Prometheus collectors
+internal/pool                    # round-robin + atomic health state
+
+internal/config/config.go        # YAML schema, defaults, Load
+internal/config/validate.go      # Config.Validate
+internal/config/watcher.go       # fsnotify + SIGHUP reload
+
+internal/auth/auth.go            # bcrypt store, HTTP Basic auth
+internal/auth/socks5.go          # RFC 1929 wire format
+
+internal/health/health.go        # Scheduler: Run/Stop/RequestImmediateProbe
+internal/health/dial.go          # shared upstream dialer (TCP/TLS)
+internal/health/probe_http.go    # HTTP probe
+internal/health/probe_socks5.go  # SOCKS5 probe
+
+internal/listener/listener.go    # Server interface, Dependencies, Prober
+internal/listener/dial.go        # shared upstream dialer
+internal/listener/pipe.go        # bidirectional byte pump
+internal/listener/http.go        # HTTPListener lifecycle + request dispatch
+internal/listener/http_forward.go # plain HTTP forwarding
+internal/listener/http_connect.go # CONNECT tunnel
+internal/listener/socks5.go      # SOCKS5Listener lifecycle + protocol state machine
+internal/listener/socks5_forward.go # upstream forwarding/auth wire helpers
 ```
 
 The `Server` interface in `internal/listener` is the seam that lets the
 `activeRuntime` in `main.go` swap listeners on config reload without
 dropping in-flight traffic.
 
+### Hot reload flow
+
+```mermaid
+flowchart LR
+    trigger(["SIGHUP / config file change"])
+    watcher["Config Watcher\n(debounced)"]
+    build["buildRuntime()\nnew pool + auth + scheduler + listeners"]
+    swap["activeRuntime.swap()"]
+    stop["stop previous scheduler\n(background, non-blocking)"]
+    reconcile["reconcileListeners()\nSetDeps on survivors, start new, stop removed"]
+    done(["reload complete — sockets stay bound"])
+
+    trigger --> watcher --> build --> swap
+    swap --> stop
+    swap --> reconcile --> done
+```
+
 ### Request lifecycle (HTTP)
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L as HTTPListener
+    participant A as Auth Store
+    participant P as Pool
+    participant U as Upstream
+
+    C->>L: GET http://example.com/ HTTP/1.1
+    L->>A: verify Proxy-Authorization
+    alt missing/invalid credentials
+        A-->>L: reject
+        L-->>C: 407 Proxy Authentication Required
+    else ok (or auth disabled)
+        L->>P: Next(protocol) round-robin
+        P-->>L: upstream candidate
+        L->>U: dial + replay request
+        alt upstream succeeds
+            U-->>L: response
+            L-->>C: stream response, bump metrics
+            L->>P: RecordUp(upstream)
+        else upstream fails
+            L->>P: RecordDown(upstream)
+            L->>L: try next upstream (up to 4 attempts)
+        end
+    end
+```
 
 1. Client connects, sends `GET http://example.com/ HTTP/1.1`.
 2. `HTTPListener.handle` checks `Proxy-Authorization` against the auth
@@ -177,6 +270,36 @@ request (up to 4 attempts) and marks the failed upstream as a
 `RecordDown`, which nudges the health state.
 
 ### Request lifecycle (SOCKS5)
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L as SOCKS5Listener
+    participant A as Auth Store
+    participant P as Pool
+    participant U as Upstream
+
+    C->>L: method negotiation
+    L-->>C: chosen method (0x00 no-auth / 0x02 user-pass)
+    opt auth required
+        C->>L: username/password subnegotiation
+        L->>A: verify credentials
+        A-->>L: ok / fail
+    end
+    C->>L: CONNECT request
+    L->>P: Next(protocol) round-robin
+    P-->>L: upstream candidate
+    L->>U: dial + replay method negotiation + connect
+    alt upstream succeeds
+        U-->>L: connect reply
+        L-->>C: success reply
+        L->>P: RecordUp(upstream)
+        L->>L: pump bytes both ways
+    else upstream fails
+        L->>P: RecordDown(upstream)
+        L->>L: try next upstream (up to 4 attempts)
+    end
+```
 
 1. Client connects, sends method negotiation.
 2. `SOCKS5Listener.handle` picks a method (`0x00` if no users configured,

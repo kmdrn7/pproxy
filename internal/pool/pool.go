@@ -22,9 +22,9 @@ const (
 
 // entry is the runtime representation of a single Upstream.
 type entry struct {
-	upstream            config.Upstream
-	state               atomic.Int32
-	consecutiveFailures atomic.Int32
+	upstream             config.Upstream
+	state                atomic.Int32
+	consecutiveFailures  atomic.Int32
 	consecutiveSuccesses atomic.Int32
 }
 

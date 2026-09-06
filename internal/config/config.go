@@ -3,16 +3,11 @@
 package config
 
 import (
-	"context"
-	"errors"
 	"fmt"
-	"log/slog"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"gopkg.in/yaml.v3"
 )
 
@@ -36,11 +31,11 @@ func (p Protocol) Valid() bool {
 
 // Config is the root schema of the YAML file.
 type Config struct {
-	Logging Logging `yaml:"logging"`
-	Server  Server  `yaml:"server"`
-	Health  Health  `yaml:"health"`
-	Auth    Auth    `yaml:"auth"`
-	Listen  []Listen `yaml:"listen"`
+	Logging Logging    `yaml:"logging"`
+	Server  Server     `yaml:"server"`
+	Health  Health     `yaml:"health"`
+	Auth    Auth       `yaml:"auth"`
+	Listen  []Listen   `yaml:"listen"`
 	Pool    []Upstream `yaml:"pool"`
 }
 
@@ -52,7 +47,7 @@ type Logging struct {
 
 // Server holds process-wide runtime parameters.
 type Server struct {
-	MetricsAddress string        `yaml:"metrics_address"`
+	MetricsAddress  string        `yaml:"metrics_address"`
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
 }
 
@@ -167,75 +162,6 @@ func (c *Config) applyDefaults() {
 	}
 }
 
-// Validate enforces the invariants the rest of the binary relies on.
-func (c *Config) Validate() error {
-	if len(c.Listen) == 0 {
-		return errors.New("config: at least one listen entry is required")
-	}
-	if len(c.Pool) == 0 {
-		return errors.New("config: at least one pool entry is required")
-	}
-	listenKeys := make(map[string]struct{}, len(c.Listen))
-	for i, l := range c.Listen {
-		if !l.Protocol.Valid() {
-			return fmt.Errorf("config: listen[%d]: invalid protocol %q", i, l.Protocol)
-		}
-		if l.Port <= 0 || l.Port > 65535 {
-			return fmt.Errorf("config: listen[%d]: port must be 1..65535", i)
-		}
-		k := fmt.Sprintf("%s|%s:%d", l.Protocol, l.Address, l.Port)
-		if _, dup := listenKeys[k]; dup {
-			return fmt.Errorf("config: listen[%d]: duplicate listener %s", i, k)
-		}
-		listenKeys[k] = struct{}{}
-	}
-	poolNames := make(map[string]struct{}, len(c.Pool))
-	for i, u := range c.Pool {
-		if strings.TrimSpace(u.Name) == "" {
-			return fmt.Errorf("config: pool[%d]: name is required", i)
-		}
-		if _, dup := poolNames[u.Name]; dup {
-			return fmt.Errorf("config: pool[%d]: duplicate name %q", i, u.Name)
-		}
-		poolNames[u.Name] = struct{}{}
-		if !u.Type.Valid() {
-			return fmt.Errorf("config: pool[%d] %q: invalid type %q", i, u.Name, u.Type)
-		}
-		if u.Address == "" {
-			return fmt.Errorf("config: pool[%d] %q: address is required", i, u.Name)
-		}
-	}
-	if c.Health.Interval < time.Second {
-		return errors.New("config: health.interval must be >= 1s")
-	}
-	if c.Health.Timeout >= c.Health.Interval {
-		return errors.New("config: health.timeout must be less than health.interval")
-	}
-	if c.Health.FailThreshold < 1 {
-		return errors.New("config: health.fail_threshold must be >= 1")
-	}
-	if c.Health.SuccessThreshold < 1 {
-		return errors.New("config: health.success_threshold must be >= 1")
-	}
-	if c.Server.ShutdownTimeout < time.Second {
-		return errors.New("config: server.shutdown_timeout must be >= 1s")
-	}
-	seen := make(map[string]struct{}, len(c.Auth.Users))
-	for i, u := range c.Auth.Users {
-		if u.Username == "" {
-			return fmt.Errorf("config: auth.users[%d]: username is required", i)
-		}
-		if u.PasswordHash == "" {
-			return fmt.Errorf("config: auth.users[%d] %q: password_hash is required", i, u.Username)
-		}
-		if _, dup := seen[u.Username]; dup {
-			return fmt.Errorf("config: auth.users[%d]: duplicate username %q", i, u.Username)
-		}
-		seen[u.Username] = struct{}{}
-	}
-	return nil
-}
-
 // Load reads, parses, defaults, and validates the YAML at path.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -253,101 +179,4 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	return &c, nil
-}
-
-// Watcher fires onChange whenever the config file at path is modified on
-// disk. It also exposes a Trigger channel that callers can signal (e.g. on
-// SIGHUP) to force an immediate reload.
-type Watcher struct {
-	path    string
-	log     *slog.Logger
-	onChange func(*Config)
-}
-
-// NewWatcher returns a Watcher bound to path. The callback runs synchronously
-// on the watcher's goroutine; the caller is responsible for re-entrancy.
-func NewWatcher(path string, log *slog.Logger, onChange func(*Config)) *Watcher {
-	return &Watcher{path: path, log: log, onChange: onChange}
-}
-
-// Run blocks until ctx is cancelled, reloading the config on fsnotify events
-// and on every value received from trigger. If a reload fails the error is
-// logged and the previous config is kept. The initial config is the
-// caller's responsibility; this watcher only handles subsequent updates.
-//
-// The watcher debounces bursts (a single editor save typically produces
-// several fsnotify events: CREATE for the temp file, WRITE for the
-// contents, RENAME for the swap-in) and re-installs the watch after a
-// RENAME because the inotify watch is bound to the old inode.
-func (w *Watcher) Run(ctx context.Context, trigger <-chan struct{}) error {
-	dir := filepath.Dir(w.path)
-	const debounce = 200 * time.Millisecond
-
-	fs, err := fsnotify.NewWatcher()
-	if err != nil {
-		return fmt.Errorf("config: watch: %w", err)
-	}
-	defer fs.Close()
-
-	if err := fs.Add(dir); err != nil {
-		return fmt.Errorf("config: watch dir %s: %w", dir, err)
-	}
-
-	var debounceTimer *time.Timer
-	scheduleReload := func(reason string) {
-		if debounceTimer != nil {
-			debounceTimer.Stop()
-		}
-		debounceTimer = time.AfterFunc(debounce, func() {
-			w.reload(reason)
-		})
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			if debounceTimer != nil {
-				debounceTimer.Stop()
-			}
-			return nil
-		case ev, ok := <-fs.Events:
-			if !ok {
-				return nil
-			}
-			// Some editors swap the file via rename(2); the inotify watch
-			// on the old inode is no longer valid. Re-add the watch so we
-			// keep receiving events on the new inode.
-			if ev.Op&fsnotify.Rename != 0 {
-				if err := fs.Add(dir); err != nil {
-					w.log.Error("config: re-add watch after rename failed", "err", err)
-				}
-			}
-			if filepath.Clean(ev.Name) != filepath.Clean(w.path) {
-				continue
-			}
-			if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
-				scheduleReload("fsnotify")
-			}
-		case err, ok := <-fs.Errors:
-			if !ok {
-				return nil
-			}
-			w.log.Error("config: fsnotify error", "err", err)
-		case <-trigger:
-			if debounceTimer != nil {
-				debounceTimer.Stop()
-			}
-			w.reload("signal")
-		}
-	}
-}
-
-func (w *Watcher) reload(reason string) {
-	cfg, err := Load(w.path)
-	if err != nil {
-		w.log.Error("config: reload failed", "reason", reason, "err", err)
-		return
-	}
-	w.log.Info("config: reloaded", "reason", reason, "upstreams", len(cfg.Pool), "listeners", len(cfg.Listen))
-	w.onChange(cfg)
 }
